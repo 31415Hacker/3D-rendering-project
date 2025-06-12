@@ -2,7 +2,6 @@
 const canvas = document.getElementById("glCanvas");
 canvas.width = window.innerWidth;
 canvas.height = window.innerHeight;
-
 const gl = canvas.getContext("webgl2");
 if (!gl) throw new Error("WebGL2 not supported");
 
@@ -22,14 +21,12 @@ precision highp float;
 out vec4 outColor;
 in vec2 v_uv;
 
-// Uniforms
 uniform vec3 u_cameraPos;
 uniform vec3 u_cameraTarget;
 uniform vec3 u_cameraUp;
 uniform float u_fov;
 uniform float u_aspect;
 
-// Sphere intersection
 float sphereIntersect(vec3 ro, vec3 rd, vec3 center, float radius) {
   vec3 oc = ro - center;
   float b = dot(oc, rd);
@@ -39,35 +36,88 @@ float sphereIntersect(vec3 ro, vec3 rd, vec3 center, float radius) {
   return -b - sqrt(h);
 }
 
-// Main
 void main() {
-  // Build camera basis
   vec3 forward = normalize(u_cameraTarget - u_cameraPos);
   vec3 right = normalize(cross(forward, u_cameraUp));
   vec3 up = cross(right, forward);
 
-  // Screen UV
   vec2 uv = v_uv * 2.0 - 1.0;
   uv.x *= u_aspect;
   float focalLength = 1.0 / tan(u_fov * 0.5);
 
-  // Ray setup
   vec3 ro = u_cameraPos;
   vec3 rd = normalize(forward * focalLength + right * uv.x + up * uv.y);
 
-  // Scene
-  vec3 sphereCenter = vec3(0.0, 0.0, -2.0);
-  float t = sphereIntersect(ro, rd, sphereCenter, 0.6);
+  // Define multiple spheres
+  const int SPHERE_COUNT = 10;
+  vec3 sphereCenters[SPHERE_COUNT];
+  float sphereRadii[SPHERE_COUNT];
 
-  if (t > 0.0) {
-    vec3 hit = ro + t * rd;
-    vec3 normal = normalize(hit - sphereCenter);
+  sphereCenters[0] = vec3(0.0, 0.0, -2.0);
+  sphereRadii[0] = 0.6;
+
+  sphereCenters[1] = vec3(1.2, 0.5, -3.0);
+  sphereRadii[1] = 0.4;
+
+  sphereCenters[2] = vec3(-1.0, -0.3, -2.5);
+  sphereRadii[2] = 0.5;
+
+  sphereCenters[3] = vec3(-2.0, 0.5, -4.0);
+  sphereRadii[3] = 0.7;
+
+  sphereCenters[4] = vec3(2.5, -0.5, -5.0);
+  sphereRadii[4] = 0.6;
+
+  sphereCenters[5] = vec3(0.5, 1.5, -4.5);
+  sphereRadii[5] = 0.5;
+
+  sphereCenters[6] = vec3(-1.5, -1.0, -3.5);
+  sphereRadii[6] = 0.6;
+
+  sphereCenters[7] = vec3(1.5, -1.0, -2.8);
+  sphereRadii[7] = 0.5;
+
+  sphereCenters[8] = vec3(-2.5, 1.2, -6.0);
+  sphereRadii[8] = 0.8;
+
+  sphereCenters[9] = vec3(0.0, 2.0, -5.5);
+  sphereRadii[9] = 0.7;
+
+  // Find closest intersection
+  float closestT = 1e20;
+  int hitSphere = -1;
+
+  for (int i = 0; i < SPHERE_COUNT; i++) {
+    float t = sphereIntersect(ro, rd, sphereCenters[i], sphereRadii[i]);
+    if (t > 0.0 && t < closestT) {
+      closestT = t;
+      hitSphere = i;
+    }
+  }
+
+  // Shading
+  if (hitSphere != -1) {
+    vec3 hit = ro + closestT * rd;
+    vec3 normal = normalize(hit - sphereCenters[hitSphere]);
     vec3 lightDir = normalize(vec3(1.0, 1.0, 1.0));
     float diffuse = max(dot(normal, lightDir), 0.0);
-    vec3 albedo = vec3(0.0, 0.0, 1.0);
-    outColor = vec4(diffuse * albedo, 1.0); // lit color
+
+    // Different color per sphere
+    vec3 colors[SPHERE_COUNT];
+    colors[0] = vec3(0.0, 0.0, 1.0);  // Blue
+    colors[1] = vec3(1.0, 0.0, 0.0);  // Red
+    colors[2] = vec3(0.0, 1.0, 0.0);  // Green
+    colors[3] = vec3(0.0, 0.0, 1.0);  // Blue
+    colors[4] = vec3(1.0, 0.0, 0.0);  // Red
+    colors[5] = vec3(0.0, 1.0, 0.0);  // Green
+    colors[6] = vec3(0.0, 0.0, 1.0);  // Blue
+    colors[7] = vec3(1.0, 0.0, 0.0);  // Red
+    colors[8] = vec3(0.0, 1.0, 0.0);  // Green
+    colors[9] = vec3(1.0, 1.0, 1.0);  // White
+
+    outColor = vec4(diffuse * colors[hitSphere], 1.0);
   } else {
-    outColor = vec4(0.6, 0.8, 1.0, 1.0); // background
+    outColor = vec4(0.6, 0.8, 1.0, 1.0); // Background
   }
 }
 `;
@@ -116,15 +166,15 @@ const u_cameraUpLoc = gl.getUniformLocation(program, "u_cameraUp");
 const u_fovLoc = gl.getUniformLocation(program, "u_fov");
 const u_aspectLoc = gl.getUniformLocation(program, "u_aspect");
 
-// Camera parameters
+// FPS Camera state
 let cameraPos = [0, 0, 1];
-let cameraTarget = [0, 0, -2];
+let yaw = 0;     // rotation around Y
+let pitch = 0;   // rotation around X
 const cameraUp = [0, 1, 0];
-const fov = Math.PI / 3; // 60 deg
+const fov = Math.PI / 3;
 const aspect = canvas.width / canvas.height;
 
-// Keyboard handling
-const keys = [];
+let keys = [];
 window.addEventListener("keydown", e => {
   if (!keys.includes(e.key)) keys.push(e.key);
 });
@@ -133,50 +183,98 @@ window.addEventListener("keyup", e => {
   if (index !== -1) keys.splice(index, 1);
 });
 
+// Mouse look
+canvas.requestPointerLock = canvas.requestPointerLock || canvas.mozRequestPointerLock;
+canvas.onclick = () => canvas.requestPointerLock();
+
+document.addEventListener("pointerlockchange", () => {
+  if (document.pointerLockElement === canvas) {
+    document.addEventListener("mousemove", onMouseMove, false);
+  } else {
+    document.removeEventListener("mousemove", onMouseMove, false);
+  }
+});
+
+function onMouseMove(e) {
+  const sensitivity = 0.002;
+  yaw += e.movementX * sensitivity;
+  pitch -= e.movementY * sensitivity;
+  pitch = Math.max(-Math.PI / 2 + 0.01, Math.min(Math.PI / 2 - 0.01, pitch));
+}
+
+// FPS Counter
+const fpsCounter = document.getElementById("fpsCounter");
+let lastFrameTime = performance.now();
+let frameCount = 0;
+let lastFpsUpdate = performance.now();
+
+// Render
 function render() {
-  // Camera move speed
+  // Update camera target
+  const cosPitch = Math.cos(pitch);
+  const sinPitch = Math.sin(pitch);
+  const cosYaw = Math.cos(yaw);
+  const sinYaw = Math.sin(yaw);
+
+  const forward = [
+    cosPitch * sinYaw,
+    sinPitch,
+    cosPitch * cosYaw * -1
+  ];
+
+  const right = [cosYaw, 0, sinYaw];
   const speed = 0.05;
 
-  // Camera movement with WASD
-  if (keys.includes("a") || keys.includes("A")) {
-    cameraPos[0] -= speed;
-  }
-  if (keys.includes("d") || keys.includes("D")) {
-    cameraPos[0] += speed;
-  }
+  // Move camera
   if (keys.includes("w") || keys.includes("W")) {
-    cameraPos[2] -= speed;
+    cameraPos[0] += forward[0] * speed;
+    cameraPos[1] += forward[1] * speed;
+    cameraPos[2] += forward[2] * speed;
   }
   if (keys.includes("s") || keys.includes("S")) {
-    cameraPos[2] += speed;
+    cameraPos[0] -= forward[0] * speed;
+    cameraPos[1] -= forward[1] * speed;
+    cameraPos[2] -= forward[2] * speed;
   }
-  if (keys.includes("ArrowUp")) {
-    cameraTarget[1] += speed;
+  if (keys.includes("a") || keys.includes("A")) {
+    cameraPos[0] -= right[0] * speed;
+    cameraPos[2] -= right[2] * speed;
   }
-  if (keys.includes("ArrowDown")) {
-    cameraTarget[1] -= speed;
+  if (keys.includes("d") || keys.includes("D")) {
+    cameraPos[0] += right[0] * speed;
+    cameraPos[2] += right[2] * speed;
   }
-  if (keys.includes("ArrowRight")) {
-    cameraTarget[2] += speed;
-  }
-  if (keys.includes("ArrowLeft")) {
-    cameraTarget[2] -= speed;
-  }
+
+  const cameraTarget = [
+    cameraPos[0] + forward[0],
+    cameraPos[1] + forward[1],
+    cameraPos[2] + forward[2]
+  ];
 
   // Render
   gl.viewport(0, 0, canvas.width, canvas.height);
   gl.useProgram(program);
   gl.bindVertexArray(vao);
 
-  // Upload uniforms
   gl.uniform3fv(u_cameraPosLoc, cameraPos);
   gl.uniform3fv(u_cameraTargetLoc, cameraTarget);
   gl.uniform3fv(u_cameraUpLoc, cameraUp);
   gl.uniform1f(u_fovLoc, fov);
   gl.uniform1f(u_aspectLoc, aspect);
 
-  // Draw
   gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+  // FPS counting
+  const now = performance.now();
+  frameCount++;
+  if (now - lastFpsUpdate >= 500) {
+    const fps = (frameCount / (now - lastFpsUpdate)) * 1000;
+    fpsCounter.style.color = fps > 50 ? "green" : fps > 30 ? "yellow" : "red";
+    fpsCounter.textContent = `FPS: ${fps.toFixed(1)}`;
+    lastFpsUpdate = now;
+    frameCount = 0;
+  }
+
   requestAnimationFrame(render);
 }
 render();

@@ -1,3 +1,5 @@
+// === raytracer_temporal.js ===
+
 // === Global State & Constants ===
 const canvas = document.getElementById("glCanvas");
 canvas.width = window.innerWidth;
@@ -15,29 +17,46 @@ const sphereCenters = [
 ];
 const sphereRadii = [0.6, 0.4, 0.5, 0.7, 0.6, 0.5, 0.6, 0.5, 0.8, 0.7];
 const colors = [
-  [0, 0, 1], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 0, 0],
-  [0, 1, 0], [0, 0, 1], [1, 0, 0], [0, 1, 0], [1, 1, 1]
+  [0,0,1],[1,0,0],[0,1,0],[0,0,1],[1,0,0],
+  [0,1,0],[0,0,1],[1,0,0],[0,1,0],[1,1,1]
 ];
 
-let cameraPos = [0, 0, 1];
+let cameraPos = [0,0,1];
 let yaw = 0, pitch = 0;
 const keys = [];
 
 let lastFpsUpdate = performance.now();
 let frameCount = 0;
+let frameIndex = 0;
+const MAX_FRAMES = 10000;       // maximum accumulation frames
+const MOVE_THRESHOLD = 0.001;  // movement speed that reduces accumulation
+
+// store previous camera state for speed calculation
+let prevCameraPos = [...cameraPos];
+let prevYaw = yaw, prevPitch = pitch;
+
+// === Temporal accumulation setup ===
+const accumFBO = gl.createFramebuffer();
+let texA = createAccumTexture(), texB = createAccumTexture();
+let pingTex = texA, pongTex = texB;
+
+function createAccumTexture() {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, canvas.width, canvas.height, 0,
+                gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return tex;
+}
 
 // === Input Handling ===
-window.addEventListener("keydown", e => {
-  if (!keys.includes(e.key)) keys.push(e.key);
-});
-window.addEventListener("keyup",   e => {
-  const i = keys.indexOf(e.key);
-  if (i !== -1) keys.splice(i, 1);
-});
-
+window.addEventListener("keydown", e => { if (!keys.includes(e.key)) keys.push(e.key); });
+window.addEventListener("keyup", e => { const i = keys.indexOf(e.key); if (i !== -1) keys.splice(i,1); });
 canvas.requestPointerLock = canvas.requestPointerLock || canvas.mozRequestPointerLock;
 canvas.onclick = () => canvas.requestPointerLock();
-
 document.addEventListener("pointerlockchange", () => {
   if (document.pointerLockElement === canvas) {
     document.addEventListener("mousemove", onMouseMove, false);
@@ -45,136 +64,171 @@ document.addEventListener("pointerlockchange", () => {
     document.removeEventListener("mousemove", onMouseMove, false);
   }
 });
-
 function onMouseMove(e) {
-  const sensitivity = 0.002;
-  yaw   += e.movementX * sensitivity;
-  pitch -= e.movementY * sensitivity;
-  pitch = Math.max(-Math.PI/2 + 0.01, Math.min(Math.PI/2 - 0.01, pitch));
+  const s = 0.002;
+  yaw   += e.movementX * s;
+  pitch -= e.movementY * s;
+  pitch = Math.max(-Math.PI/2+0.01, Math.min(Math.PI/2-0.01, pitch));
 }
 
 // === Utility: Compile a shader ===
-function createShader(gl, type, src) {
-  const shader = gl.createShader(type);
-  gl.shaderSource(shader, src);
-  gl.compileShader(shader);
-  if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
-    throw new Error(gl.getShaderInfoLog(shader));
-  }
-  return shader;
+function createShader(gl,type,src){
+  const s = gl.createShader(type);
+  gl.shaderSource(s,src);
+  gl.compileShader(s);
+  if (!gl.getShaderParameter(s,gl.COMPILE_STATUS))
+    throw new Error(gl.getShaderInfoLog(s));
+  return s;
 }
 
-// === Step 1: Load shader source texts ===
-async function loadShaders() {
-  const [vsResp, fsResp] = await Promise.all([
-    fetch('shader.vert'),
-    fetch('shader.frag')
-  ]);
-  if (!vsResp.ok) throw new Error("Vertex shader failed to load");
-  if (!fsResp.ok) throw new Error("Fragment shader failed to load");
-  const [vsSrc, fsSrc] = await Promise.all([vsResp.text(), fsResp.text()]);
+// === Step 1: Load shader sources ===
+async function loadShaders(){
+  const [vsR,fsR] = await Promise.all([ fetch('shader.vert'), fetch('shader.frag') ]);
+  if (!vsR.ok) throw new Error("Vertex shader failed to load");
+  if (!fsR.ok) throw new Error("Fragment shader failed to load");
+  const [vsSrc,fsSrc] = await Promise.all([ vsR.text(), fsR.text() ]);
   return { vsSrc, fsSrc };
 }
 
 // === Step 2: Create & link program ===
-function createProgramFromSources(gl, vsSrc, fsSrc) {
-  const vs = createShader(gl, gl.VERTEX_SHADER,   vsSrc);
-  const fs = createShader(gl, gl.FRAGMENT_SHADER, fsSrc);
-  const program = gl.createProgram();
-  gl.attachShader(program, vs);
-  gl.attachShader(program, fs);
-  gl.linkProgram(program);
-  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
-    throw new Error(gl.getProgramInfoLog(program));
-  }
-  return program;
+function createProgram(gl,vsSrc,fsSrc){
+  const vs = createShader(gl,gl.VERTEX_SHADER,vsSrc);
+  const fs = createShader(gl,gl.FRAGMENT_SHADER,fsSrc);
+  const prog = gl.createProgram();
+  gl.attachShader(prog,vs);
+  gl.attachShader(prog,fs);
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog,gl.LINK_STATUS))
+    throw new Error(gl.getProgramInfoLog(prog));
+  return prog;
 }
 
-// === Step 3: Set up VAO + capture uniform locations ===
-function setupScene(gl, program) {
-  // Quad covering NDC
-  const quad = new Float32Array([-1,-1, 1,-1, -1,1, 1,1]);
-  const vao = gl.createVertexArray();
-  const vbo = gl.createBuffer();
-  const posLoc = gl.getAttribLocation(program, "a_position");
-
+// === Step 3: Setup VAO + Uniforms ===
+function setupScene(gl,prog){
+  const quad = new Float32Array([-1,-1,1,-1,-1,1,1,1]);
+  const vao = gl.createVertexArray(), vbo = gl.createBuffer();
+  const posLoc = gl.getAttribLocation(prog,"a_position");
   gl.bindVertexArray(vao);
-  gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
-  gl.bufferData(gl.ARRAY_BUFFER, quad, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER,vbo);
+  gl.bufferData(gl.ARRAY_BUFFER,quad,gl.STATIC_DRAW);
   gl.enableVertexAttribArray(posLoc);
-  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
-
-  // Uniforms
+  gl.vertexAttribPointer(posLoc,2,gl.FLOAT,false,0,0);
   return {
     vao,
-    u_cameraPos:    gl.getUniformLocation(program, "u_cameraPos"),
-    u_cameraTarget: gl.getUniformLocation(program, "u_cameraTarget"),
-    u_cameraUp:     gl.getUniformLocation(program, "u_cameraUp"),
-    u_fov:          gl.getUniformLocation(program, "u_fov"),
-    u_aspect:       gl.getUniformLocation(program, "u_aspect"),
-    u_centers:      gl.getUniformLocation(program, "u_sphereCenters"),
-    u_radii:        gl.getUniformLocation(program, "u_sphereRadii"),
-    u_colors:       gl.getUniformLocation(program, "u_colors")
+    u_cameraPos:    gl.getUniformLocation(prog,"u_cameraPos"),
+    u_cameraTarget: gl.getUniformLocation(prog,"u_cameraTarget"),
+    u_cameraUp:     gl.getUniformLocation(prog,"u_cameraUp"),
+    u_fov:          gl.getUniformLocation(prog,"u_fov"),
+    u_aspect:       gl.getUniformLocation(prog,"u_aspect"),
+    u_centers:      gl.getUniformLocation(prog,"u_sphereCenters"),
+    u_radii:        gl.getUniformLocation(prog,"u_sphereRadii"),
+    u_colors:       gl.getUniformLocation(prog,"u_colors"),
+    u_time:         gl.getUniformLocation(prog,"u_time"),
+    u_frameIndex:   gl.getUniformLocation(prog,"u_frameIndex"),
+    u_maxFrames:    gl.getUniformLocation(prog,"u_maxFrames"),
+    u_prevFrameTex: gl.getUniformLocation(prog,"u_prevFrameTex")
   };
 }
 
-// === Step 4: Render loop ===
-function startRenderLoop(gl, program, scene) {
-  const { vao, u_cameraPos, u_cameraTarget, u_cameraUp, u_fov, u_aspect, u_centers, u_radii, u_colors } = scene;
+// === Step 4: Render Loop with dynamic accumulation cap ===
+function startRenderLoop(gl,prog,scene){
+  const {
+    vao,u_cameraPos,u_cameraTarget,u_cameraUp,
+    u_fov,u_aspect,u_centers,u_radii,u_colors,
+    u_time,u_frameIndex,u_prevFrameTex,u_maxFrames
+  } = scene;
 
-  function render() {
-    // Camera orientation
+  function render(){
+    // update camera
     const cosP = Math.cos(pitch), sinP = Math.sin(pitch);
     const cosY = Math.cos(yaw),   sinY = Math.sin(yaw);
-    const forward = [ cosP*sinY, sinP, -cosP*cosY ];
-    const right   = [ cosY, 0, sinY ];
+    const forward = [cosP*sinY, sinP, -cosP*cosY];
+    const right   = [cosY, 0, sinY];
     const speed = 0.05;
+    if(keys.includes("w")) cameraPos = cameraPos.map((v,i)=>v+forward[i]*speed);
+    if(keys.includes("s")) cameraPos = cameraPos.map((v,i)=>v-forward[i]*speed);
+    if(keys.includes("a")) cameraPos = cameraPos.map((v,i)=>v-right[i]*speed);
+    if(keys.includes("d")) cameraPos = cameraPos.map((v,i)=>v+right[i]*speed);
+    const cameraTarget = cameraPos.map((v,i)=>v+forward[i]);
 
-    // WASD movement
-    if (keys.includes("w")||keys.includes("W")) cameraPos = cameraPos.map((v,i)=>v + forward[i]*speed);
-    if (keys.includes("s")||keys.includes("S")) cameraPos = cameraPos.map((v,i)=>v - forward[i]*speed);
-    if (keys.includes("a")||keys.includes("A")) cameraPos = cameraPos.map((v,i)=>v - right[i]*speed);
-    if (keys.includes("d")||keys.includes("D")) cameraPos = cameraPos.map((v,i)=>v + right[i]*speed);
+    // compute movement metric
+    const dp = Math.hypot(
+      cameraPos[0]-prevCameraPos[0],
+      cameraPos[1]-prevCameraPos[1],
+      cameraPos[2]-prevCameraPos[2]
+    );
+    const da = Math.abs(yaw - prevYaw) + Math.abs(pitch - prevPitch);
+    const movement = dp + da;
+    // dynamic max accumulation frames
+    const tNorm = Math.min(movement / MOVE_THRESHOLD, 1.0);
+    const dynamicMax = Math.max(1, Math.floor(MAX_FRAMES * (1.0 - tNorm)));
 
-    const cameraTarget = cameraPos.map((v,i)=>v + forward[i]);
+    // update frameIndex with cap
+    frameIndex = Math.min(frameIndex + 1, dynamicMax - 1);
 
-    // Draw
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.useProgram(program);
+    // set GL state
+    gl.useProgram(prog);
     gl.bindVertexArray(vao);
+    gl.viewport(0, 0, canvas.width, canvas.height);
+
     gl.uniform3fv(u_cameraPos,    cameraPos);
     gl.uniform3fv(u_cameraTarget, cameraTarget);
     gl.uniform3fv(u_cameraUp,      [0,1,0]);
-    gl.uniform1f(u_fov,            Math.PI/3);
+    gl.uniform1f(u_fov,            Math.PI/4);
     gl.uniform1f(u_aspect,         canvas.width/canvas.height);
     gl.uniform3fv(u_centers,       sphereCenters.flat());
     gl.uniform1fv(u_radii,         sphereRadii);
     gl.uniform3fv(u_colors,        colors.flat());
+    gl.uniform1f(u_time,           performance.now()*0.001);
+    gl.uniform1i(u_frameIndex,     frameIndex);
+    gl.uniform1i(u_maxFrames,      dynamicMax);
 
-    // FPS
+    // bind previous frame texture
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, pingTex);
+    gl.uniform1i(u_prevFrameTex, 0);
+
+    // render into FBO
+    gl.bindFramebuffer(gl.FRAMEBUFFER, accumFBO);
+    gl.framebufferTexture2D(
+      gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0,
+      gl.TEXTURE_2D, pongTex, 0
+    );
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    // blit to screen
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, pongTex);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+    // ping-pong
+    [pingTex, pongTex] = [pongTex, pingTex];
+
+    // update prev camera for next frame
+    prevCameraPos = [...cameraPos];
+    prevYaw = yaw; prevPitch = pitch;
+
+    // FPS counter
     frameCount++;
     const now = performance.now();
     if (now - lastFpsUpdate >= 500) {
-      const fps = (frameCount/(now-lastFpsUpdate))*1000;
-      fpsCounter.style.color = fps>50 ? "green" : fps>30 ? "yellow" : "red";
+      const fps = (frameCount / (now - lastFpsUpdate)) * 1000;
+      fpsCounter.style.color = fps > 50 ? "green" : fps > 30 ? "yellow" : "red";
       fpsCounter.textContent = `FPS: ${fps.toFixed(1)}`;
       lastFpsUpdate = now;
       frameCount = 0;
     }
 
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
     requestAnimationFrame(render);
   }
-
   render();
 }
 
 // === Bootstrap ===
-async function main() {
+async function main(){
   const { vsSrc, fsSrc } = await loadShaders();
-  const program = createProgramFromSources(gl, vsSrc, fsSrc);
-  const scene   = setupScene(gl, program);
-  startRenderLoop(gl, program, scene);
+  const prog = createProgram(gl, vsSrc, fsSrc);
+  const scene=setupScene(gl, prog);
+  startRenderLoop(gl, prog, scene);
 }
-
-main().catch(err => console.error(err));
+main().catch(console.error);

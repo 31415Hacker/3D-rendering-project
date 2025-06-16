@@ -48,47 +48,62 @@ async function loadObj(url) {
 function buildBVH(mesh) {
   const nodes = [];
   const triOrder = [];
-  const allTris = Array.from({length: mesh.vertIdx.length/3}, (_,i)=>i);
+  const triCount = mesh.vertIdx.length / 3;
+  const allTris = new Array(triCount);
+  for (let i = 0; i < triCount; i++) allTris[i] = i;
+
+  const triCenters = new Float32Array(triCount * 3); // precomputed triangle centers
+  for (let ti = 0; ti < triCount; ti++) {
+    let cx = 0, cy = 0, cz = 0;
+    for (let v = 0; v < 3; v++) {
+      const off = mesh.vertIdx[ti * 3 + v] * 3;
+      cx += mesh.positions[off];
+      cy += mesh.positions[off + 1];
+      cz += mesh.positions[off + 2];
+    }
+    triCenters[ti * 3 + 0] = cx / 3;
+    triCenters[ti * 3 + 1] = cy / 3;
+    triCenters[ti * 3 + 2] = cz / 3;
+  }
 
   function recurse(tris) {
     const idx = nodes.length;
     nodes.push(null);
-    let mn = [1e9,1e9,1e9], mx=[-1e9,-1e9,-1e9];
-    for (let ti of tris) {
-      for (let v=0; v<3; v++) {
-        const off = mesh.vertIdx[ti*3+v]*3;
-        for (let k=0;k<3;k++){
-          const c = mesh.positions[off+k];
-          mn[k]=Math.min(mn[k],c);
-          mx[k]=Math.max(mx[k],c);
+
+    const mn = [Infinity, Infinity, Infinity];
+    const mx = [-Infinity, -Infinity, -Infinity];
+
+    for (let i = 0; i < tris.length; i++) {
+      const ti = tris[i];
+      for (let v = 0; v < 3; v++) {
+        const off = mesh.vertIdx[ti * 3 + v] * 3;
+        for (let k = 0; k < 3; k++) {
+          const val = mesh.positions[off + k];
+          if (val < mn[k]) mn[k] = val;
+          if (val > mx[k]) mx[k] = val;
         }
       }
     }
+
     if (tris.length <= 1) {
       const start = triOrder.length;
-      tris.forEach(ti=>triOrder.push(ti));
-      nodes[idx] = { mn, mx, left:start, right:-tris.length };
+      for (let i = 0; i < tris.length; i++) triOrder.push(tris[i]);
+      nodes[idx] = { mn, mx, left: start, right: -tris.length };
     } else {
-      const ext = [mx[0]-mn[0], mx[1]-mn[1], mx[2]-mn[2]];
-      const ax = ext.indexOf(Math.max(...ext));
-      tris.sort((a,b)=> {
-        let ca=[0,0,0], cb=[0,0,0];
-        for(let v=0;v<3;v++){
-          const oa = mesh.vertIdx[a*3+v]*3;
-          ca[0]+=mesh.positions[oa];
-          ca[1]+=mesh.positions[oa+1];
-          ca[2]+=mesh.positions[oa+2];
-          const ob = mesh.vertIdx[b*3+v]*3;
-          cb[0]+=mesh.positions[ob];
-          cb[1]+=mesh.positions[ob+1];
-          cb[2]+=mesh.positions[ob+2];
-        }
-        return (ca[ax]/3) - (cb[ax]/3);
+      const ext = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
+      const ax = ext[0] > ext[1]
+        ? (ext[0] > ext[2] ? 0 : 2)
+        : (ext[1] > ext[2] ? 1 : 2);
+
+      // Sort triangle indices by center along splitting axis
+      tris.sort((a, b) => {
+        return triCenters[a * 3 + ax] - triCenters[b * 3 + ax];
       });
-      const mid = Math.floor(tris.length/2);
-      const leftIdx  = recurse(tris.slice(0,mid));
+
+      const mid = tris.length >> 1;
+      const leftIdx = recurse(tris.slice(0, mid));
       const rightIdx = recurse(tris.slice(mid));
-      nodes[idx] = { mn, mx, left:leftIdx, right:rightIdx };
+      nodes[idx] = { mn, mx, left: leftIdx, right: rightIdx };
     }
     return idx;
   }

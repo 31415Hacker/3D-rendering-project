@@ -1,326 +1,359 @@
-// main.js
-const canvas = document.getElementById("gpuCanvas");
-canvas.width  = window.innerWidth;
-canvas.height = window.innerHeight;
-const gl = canvas.getContext("webgl2");
-if (!gl) throw new Error("WebGL2 not supported");
+// script.js
 
-const fpsCounter = document.getElementById('fpsCounter');
+async function main() {
+  // — Setup WebGPU —
+  const canvas = document.getElementById("gpuCanvas");
+  canvas.width  = window.innerWidth;
+  canvas.height = window.innerHeight;
+  if (!navigator.gpu) throw new Error("WebGPU not supported");
+  const adapter = await navigator.gpu.requestAdapter();
+  const device  = await adapter.requestDevice();
+  const context = canvas.getContext("webgpu");
+  const format  = navigator.gpu.getPreferredCanvasFormat();
+  context.configure({ device, format, alphaMode: "opaque" });
 
-// — Helpers —
-async function loadText(url) {
-  const r = await fetch(url);
-  if (!r.ok) throw new Error(`Failed to load ${url}`);
-  return await r.text();
-}
-
-async function loadObj(url) {
-  const txt = await loadText(url);
-  const pos = [], nor = [], vIdx = [], nIdx = [];
-  for (let line of txt.split("\n")) {
-    line = line.trim();
-    if (line.startsWith("v ")) {
-      const [,x,y,z] = line.split(/\s+/);
-      pos.push(+x,+y,+z);
-    } else if (line.startsWith("vn ")) {
-      const [,x,y,z] = line.split(/\s+/);
-      nor.push(+x,+y,+z);
-    } else if (line.startsWith("f ")) {
-      const parts = line.split(/\s+/).slice(1);
-      for (let i=1; i<parts.length-1; i++) {
-        const [v0,n0] = parts[0].split("//").map(v=>+v-1);
-        const [v1,n1] = parts[i  ].split("//").map(v=>+v-1);
-        const [v2,n2] = parts[i+1].split("//").map(v=>+v-1);
-        vIdx.push(v0,v1,v2);
-        nIdx.push(n0,n1,n2);
-      }
-    }
+  // — Helpers to load text & OBJ —
+  async function loadText(url) {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error(`Failed to load ${url}`);
+    return r.text();
   }
-  return {
-    positions: new Float32Array(pos),
-    normals:   new Float32Array(nor),
-    vertIdx:   new Uint32Array(vIdx),
-    normIdx:   new Uint32Array(nIdx)
-  };
-}
+  async function loadObj(url) {
+    const txt = await loadText(url);
+    const pos  = [], nor  = [], vIdx = [], nIdx = [];
 
-// — Build a simple median-split BVH —
-function buildBVH(mesh) {
-  const nodes = [];
-  const triOrder = [];
-  const triCount = mesh.vertIdx.length / 3;
-  const allTris = new Array(triCount);
-  for (let i = 0; i < triCount; i++) allTris[i] = i;
-
-  const triCenters = new Float32Array(triCount * 3); // precomputed triangle centers
-  for (let ti = 0; ti < triCount; ti++) {
-    let cx = 0, cy = 0, cz = 0;
-    for (let v = 0; v < 3; v++) {
-      const off = mesh.vertIdx[ti * 3 + v] * 3;
-      cx += mesh.positions[off];
-      cy += mesh.positions[off + 1];
-      cz += mesh.positions[off + 2];
+    // Helper to convert an OBJ index (which may be negative) into a 0-based JS index
+    function toIndex(raw, count) {
+      const i = parseInt(raw, 10);
+      return i > 0
+        ? i - 1                // positive: 1→0, 2→1, …
+        : count + i;           // negative: -1 → last (count-1), -2→(count-2), …
     }
-    triCenters[ti * 3 + 0] = cx / 3;
-    triCenters[ti * 3 + 1] = cy / 3;
-    triCenters[ti * 3 + 2] = cz / 3;
-  }
 
-  function recurse(tris) {
-    const idx = nodes.length;
-    nodes.push(null);
+    for (let line of txt.split("\n")) {
+      line = line.trim();
+      if (line.startsWith("v ")) {
+        const [, x, y, z] = line.split(/\s+/);
+        pos.push(+x, +y, +z);
+      } else if (line.startsWith("vn ")) {
+        const [, x, y, z] = line.split(/\s+/);
+        nor.push(+x, +y, +z);
+      } else if (line.startsWith("f ")) {
+        const parts = line.split(/\s+/).slice(1);
+        // Pre-split each vertex reference into [v,vt,vn]
+        const refs = parts.map(p => p.split("/"));
 
-    const mn = [Infinity, Infinity, Infinity];
-    const mx = [-Infinity, -Infinity, -Infinity];
+        const vertCount = pos.length / 3;
+        const normCount = nor.length / 3;
 
-    for (let i = 0; i < tris.length; i++) {
-      const ti = tris[i];
-      for (let v = 0; v < 3; v++) {
-        const off = mesh.vertIdx[ti * 3 + v] * 3;
-        for (let k = 0; k < 3; k++) {
-          const val = mesh.positions[off + k];
-          if (val < mn[k]) mn[k] = val;
-          if (val > mx[k]) mx[k] = val;
+        // Triangulate any polygon (fan)
+        for (let i = 1; i < refs.length - 1; i++) {
+          // indices for the three corners
+          const [v0, , n0] = refs[0];
+          const [v1, , n1] = refs[i];
+          const [v2, , n2] = refs[i + 1];
+
+          const vi0 = toIndex(v0, vertCount);
+          const vi1 = toIndex(v1, vertCount);
+          const vi2 = toIndex(v2, vertCount);
+
+          const ni0 = toIndex(n0, normCount);
+          const ni1 = toIndex(n1, normCount);
+          const ni2 = toIndex(n2, normCount);
+
+          vIdx.push(vi0, vi1, vi2);
+          nIdx.push(ni0, ni1, ni2);
         }
       }
     }
 
-    if (tris.length <= 1) {
-      const start = triOrder.length;
-      for (let i = 0; i < tris.length; i++) triOrder.push(tris[i]);
-      nodes[idx] = { mn, mx, left: start, right: -tris.length };
-    } else {
-      const ext = [mx[0] - mn[0], mx[1] - mn[1], mx[2] - mn[2]];
-      const ax = ext[0] > ext[1]
-        ? (ext[0] > ext[2] ? 0 : 2)
-        : (ext[1] > ext[2] ? 1 : 2);
+    return {
+      positions: new Float32Array(pos),
+      normals:   new Float32Array(nor),
+      vertIdx:   new Uint32Array(vIdx),
+      normIdx:   new Uint32Array(nIdx),
+    };
+  }
 
-      // Sort triangle indices by center along splitting axis
-      tris.sort((a, b) => {
-        return triCenters[a * 3 + ax] - triCenters[b * 3 + ax];
-      });
-
-      const mid = tris.length >> 1;
-      const leftIdx = recurse(tris.slice(0, mid));
-      const rightIdx = recurse(tris.slice(mid));
-      nodes[idx] = { mn, mx, left: leftIdx, right: rightIdx };
+  // — Normalize mesh into unit cube centered at origin —
+  function normalizeMesh(m) {
+    const p=m.positions, n=p.length/3;
+    const mn=[Infinity,Infinity,Infinity], mx=[-Infinity,-Infinity,-Infinity];
+    for(let i=0;i<n;i++) for(let k=0;k<3;k++){
+      const v=p[3*i+k];
+      mn[k]=Math.min(mn[k],v);
+      mx[k]=Math.max(mx[k],v);
     }
-    return idx;
-  }
-
-  recurse(allTris);
-  return { nodes, triOrder };
-}
-
-// — Shader setup —
-function compile(gl,type,src){
-  const s = gl.createShader(type);
-  gl.shaderSource(s, src);
-  gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS))
-    throw new Error(gl.getShaderInfoLog(s));
-  return s;
-}
-
-function link(gl, vs, fs){
-  const p = gl.createProgram();
-  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER,   vs));
-  gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fs));
-  gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS))
-    throw new Error(gl.getProgramInfoLog(p));
-  return p;
-}
-
-// — Main bootstrap —
-async function main(){
-  const [vsSrc, fsSrc, mesh] = await Promise.all([
-    loadText("shader.vert"),
-    loadText("shader.frag"),
-    loadObj("model.obj")
-  ]);
-  const program = link(gl, vsSrc, fsSrc);
-  gl.useProgram(program);
-
-  // screen quad
-  const vao = gl.createVertexArray();
-  gl.bindVertexArray(vao);
-  const qb = gl.createBuffer();
-  gl.bindBuffer(gl.ARRAY_BUFFER, qb);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-     -1,-1,  1,-1,  -1,1,  1,1
-  ]), gl.STATIC_DRAW);
-  const posLoc = gl.getAttribLocation(program, "a_position");
-  gl.enableVertexAttribArray(posLoc);
-  gl.vertexAttribPointer(posLoc, 2, gl.FLOAT, false, 0, 0);
-
-  // build BVH
-  const { nodes, triOrder } = buildBVH(mesh);
-  const triCount  = triOrder.length;
-  const nodeCount = nodes.length;
-
-  // flatten triangles into RGBA32F texture unit 0
-  const floatsPerTri = 3 * 4;
-  const triTexSize   = Math.ceil(Math.sqrt(triCount * floatsPerTri / 4));
-  const triData      = new Float32Array(triTexSize * triTexSize * 4);
-  for (let i = 0; i < triCount; i++) {
-    const ti = triOrder[i];
-    for (let v = 0; v < 3; v++) {
-      const offV = mesh.vertIdx[ti*3 + v] * 3;
-      const pix  = (i*3 + v) * 4;
-      triData[pix  ] = mesh.positions[offV];
-      triData[pix+1] = mesh.positions[offV+1];
-      triData[pix+2] = mesh.positions[offV+2];
-      triData[pix+3] = 0;
+    const ctr=mn.map((v,i)=>(v+mx[i])*0.5);
+    const sc=1/Math.max(mx[0]-mn[0],mx[1]-mn[1],mx[2]-mn[2]);
+    for(let i=0;i<n;i++) for(let k=0;k<3;k++){
+      p[3*i+k]=(p[3*i+k]-ctr[k])*sc;
     }
+    return m;
   }
-  gl.activeTexture(gl.TEXTURE0);
-  const triTex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, triTex);
-  gl.texImage2D(
-    gl.TEXTURE_2D, 0, gl.RGBA32F,
-    triTexSize, triTexSize, 0,
-    gl.RGBA, gl.FLOAT, triData
-  );
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
-  // normals → unit 1
-  const normData = new Float32Array(triTexSize * triTexSize * 4);
-  for (let i = 0; i < triCount; i++) {
-    const ti = triOrder[i];
-    for (let v = 0; v < 3; v++) {
-      const offN = mesh.normIdx[ti*3 + v] * 3;
-      const pix  = (i*3 + v) * 4;
-      normData[pix  ] = mesh.normals[offN];
-      normData[pix+1] = mesh.normals[offN+1];
-      normData[pix+2] = mesh.normals[offN+2];
-      normData[pix+3] = 0;
+  // — Build LBVH (Morton + recursive) —
+  function buildLBVH(mesh, leafSize=1) {
+    const nodes=[], triOrder=[];
+    const tris = mesh.vertIdx.length/3;
+    const centroids = new Float32Array(tris*3);
+    for(let i=0;i<tris;i++){
+      let cx=0,cy=0,cz=0;
+      for(let v=0;v<3;v++){
+        const off=mesh.vertIdx[i*3+v]*3;
+        cx+=mesh.positions[off];
+        cy+=mesh.positions[off+1];
+        cz+=mesh.positions[off+2];
+      }
+      centroids[i*3]=cx/3; centroids[i*3+1]=cy/3; centroids[i*3+2]=cz/3;
     }
+    const sceneMin=[Infinity,Infinity,Infinity], sceneMax=[-Infinity,-Infinity,-Infinity];
+    for(let i=0;i<tris;i++){
+      for(let k=0;k<3;k++){
+        const v=centroids[i*3+k];
+        sceneMin[k]=Math.min(sceneMin[k],v);
+        sceneMax[k]=Math.max(sceneMax[k],v);
+      }
+    }
+    const diag=[sceneMax[0]-sceneMin[0],sceneMax[1]-sceneMin[1],sceneMax[2]-sceneMin[2]];
+    function expandBits(v){
+      v=(v*0x00010001)&0xFF0000FF;
+      v=(v*0x00000101)&0x0F00F00F;
+      v=(v*0x00000011)&0xC30C30C3;
+      v=(v*0x00000005)&0x49249249;
+      return v;
+    }
+    function morton(x,y,z){
+      x=Math.min(0.999999,Math.max(0,x));
+      y=Math.min(0.999999,Math.max(0,y));
+      z=Math.min(0.999999,Math.max(0,z));
+      const xi=x*1024|0, yi=y*1024|0, zi=z*1024|0;
+      return (expandBits(xi)<<2)|(expandBits(yi)<<1)|expandBits(zi);
+    }
+    const mortonArr=new Uint32Array(tris), order=new Uint32Array(tris);
+    for(let i=0;i<tris;i++){
+      const cx=(centroids[i*3]-sceneMin[0])/diag[0];
+      const cy=(centroids[i*3+1]-sceneMin[1])/diag[1];
+      const cz=(centroids[i*3+2]-sceneMin[2])/diag[2];
+      mortonArr[i]=morton(cx,cy,cz);
+      order[i]=i;
+    }
+    order.sort((a,b)=>mortonArr[a]-mortonArr[b]);
+    for(let i=0;i<tris;i++) triOrder.push(order[i]);
+    function computeBounds(slice){
+      const mn=[Infinity,Infinity,Infinity], mx=[-Infinity,-Infinity,-Infinity];
+      for(const ti of slice){
+        for(let v=0;v<3;v++){
+          const off=mesh.vertIdx[ti*3+v]*3;
+          for(let k=0;k<3;k++){
+            const val=mesh.positions[off+k];
+            mn[k]=Math.min(mn[k],val);
+            mx[k]=Math.max(mx[k],val);
+          }
+        }
+      }
+      return [mn,mx];
+    }
+    function recurse(s,e){
+      const idx=nodes.length; nodes.push(null);
+      const slice=triOrder.slice(s,e), count=e-s;
+      const [mn,mx]=computeBounds(slice);
+      if(count<=leafSize){
+        nodes[idx]={mn,mx,left:s,right:-count};
+      } else {
+        const mid=(s+e)>>>1, l=recurse(s,mid), r=recurse(mid,e);
+        nodes[idx]={mn,mx,left:l,right:r};
+      }
+      return idx;
+    }
+    recurse(0,tris);
+    return {nodes,triOrder};
   }
-  gl.activeTexture(gl.TEXTURE1);
-  const normTex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, normTex);
-  gl.texImage2D(
-    gl.TEXTURE_2D, 0, gl.RGBA32F,
-    triTexSize, triTexSize, 0,
-    gl.RGBA, gl.FLOAT, normData
-  );
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
-  // BVH nodes → unit 2
-  const nodeFloats  = nodeCount * 8;
-  const nodeTexSize = Math.ceil(Math.sqrt(nodeFloats / 4));
-  const nodeData    = new Float32Array(nodeTexSize * nodeTexSize * 4);
-  for (let i = 0; i < nodeCount; i++) {
-    const n    = nodes[i];
-    const base = i * 8;
-    nodeData[base  ] = n.mn[0];
-    nodeData[base+1] = n.mn[1];
-    nodeData[base+2] = n.mn[2];
-    nodeData[base+3] = n.left;
-    nodeData[base+4] = n.mx[0];
-    nodeData[base+5] = n.mx[1];
-    nodeData[base+6] = n.mx[2];
-    nodeData[base+7] = n.right;
+  // — Flatten to SSBO arrays (vec4 padded) —
+  function flattenForSSBO(mesh,bvh){
+    const triCount=bvh.triOrder.length;
+    const triPos=new Float32Array(triCount*3*4);
+    const triNor=new Float32Array(triCount*3*4);
+    for(let i=0;i<triCount;i++){
+      const ti=bvh.triOrder[i];
+      for(let v=0;v<3;v++){
+        const vi=mesh.vertIdx[ti*3+v],
+              ni=mesh.normIdx[ti*3+v];
+        const dst=(i*3+v)*4;
+        triPos[dst  ]=mesh.positions[vi*3  ];
+        triPos[dst+1]=mesh.positions[vi*3+1];
+        triPos[dst+2]=mesh.positions[vi*3+2];
+        triNor[dst  ]=mesh.normals  [ni*3  ];
+        triNor[dst+1]=mesh.normals  [ni*3+1];
+        triNor[dst+2]=mesh.normals  [ni*3+2];
+      }
+    }
+    const nodeCount=bvh.nodes.length;
+    const bvhData=new Float32Array(nodeCount*8);
+    for(let i=0;i<nodeCount;i++){
+      const n=bvh.nodes[i], b=i*8;
+      bvhData[b  ]=n.mn[0];
+      bvhData[b+1]=n.mn[1];
+      bvhData[b+2]=n.mn[2];
+      bvhData[b+3]=n.left;
+      bvhData[b+4]=n.mx[0];
+      bvhData[b+5]=n.mx[1];
+      bvhData[b+6]=n.mx[2];
+      bvhData[b+7]=n.right;
+    }
+    return {triPos,triNor,bvhData};
   }
-  gl.activeTexture(gl.TEXTURE2);
-  const nodeTex = gl.createTexture();
-  gl.bindTexture(gl.TEXTURE_2D, nodeTex);
-  gl.texImage2D(
-    gl.TEXTURE_2D, 0, gl.RGBA32F,
-    nodeTexSize, nodeTexSize, 0,
-    gl.RGBA, gl.FLOAT, nodeData
-  );
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
 
-  // set uniforms
-  gl.uniform1i(gl.getUniformLocation(program, "u_triTex"),     0);
-  gl.uniform1i(gl.getUniformLocation(program, "u_normTex"),    1);
-  gl.uniform1i(gl.getUniformLocation(program, "u_nodeTex"),    2);
-  gl.uniform1i(gl.getUniformLocation(program, "u_texSize"),    triTexSize);
-  gl.uniform1i(gl.getUniformLocation(program, "u_nodeTexSize"),nodeTexSize);
-  gl.uniform1i(gl.getUniformLocation(program, "u_triCount"),   triCount);
-  gl.uniform1i(gl.getUniformLocation(program, "u_nodeCount"),  nodeCount);
+  // — Load, build & flatten —
+  const meshRaw=await loadObj("dragon.obj").then(normalizeMesh);
+  const {nodes,triOrder}=buildLBVH(meshRaw, 1);
+  const {triPos,triNor,bvhData}=flattenForSSBO(meshRaw,{nodes,triOrder});
 
-  const uCamPos = gl.getUniformLocation(program, "u_cameraPos");
-  const uCamTgt = gl.getUniformLocation(program, "u_cameraTarget");
-  const uCamUp  = gl.getUniformLocation(program, "u_cameraUp");
-  const uFov    = gl.getUniformLocation(program, "u_fov");
-  const uAsp    = gl.getUniformLocation(program, "u_aspect");
-  const uModel  = gl.getUniformLocation(program, "u_model");
+  // — Split each SSBO exactly in half —
+  function splitHalf(arr){
+    const vec4Count=arr.length/4;
+    const half=Math.ceil(vec4Count/2);
+    return [
+      arr.slice(0, half*4),
+      arr.slice(half*4)
+    ];
+  }
+  const [pos0,pos1] = splitHalf(triPos);
+  const [nor0,nor1] = splitHalf(triNor);
+  const [bvh0,bvh1] = splitHalf(bvhData);
 
-  // camera + controls
-  let cameraPos = [0,0,3], yaw = 0, pitch = 0, keys = [];
-  window.addEventListener("keydown", e => { if (!keys.includes(e.key)) keys.push(e.key); });
-  window.addEventListener("keyup",   e => { const i = keys.indexOf(e.key); if (i>=0) keys.splice(i,1); });
-  canvas.onclick = () => canvas.requestPointerLock();
-  document.addEventListener("pointerlockchange", () => {
-    if (document.pointerLockElement === canvas)
-      document.addEventListener("mousemove", onMouseMove);
+  // — Create GPUStorageBuffers —
+  function makeBuf(arr){
+    const buf=device.createBuffer({
+      size: arr.byteLength,
+      usage: GPUBufferUsage.STORAGE|GPUBufferUsage.COPY_DST
+    });
+    device.queue.writeBuffer(buf,0,arr);
+    return buf;
+  }
+  const triPos0Buf   = makeBuf(pos0);
+  const triPos1Buf   = makeBuf(pos1);
+  const triNor0Buf   = makeBuf(nor0);
+  const triNor1Buf   = makeBuf(nor1);
+  const bvhNodes0Buf = makeBuf(bvh0);
+  const bvhNodes1Buf = makeBuf(bvh1);
+
+  // — Uniform buffer —
+  const uniformBuf = device.createBuffer({
+    size: 144,
+    usage: GPUBufferUsage.UNIFORM|GPUBufferUsage.COPY_DST
+  });
+
+  // — Load WGSL template & inject counts —
+  let wgsl = await loadText("shader.wgsl");
+  wgsl = wgsl
+    .replace("__COUNT_POS0__",   `${pos0.length/4}u`)
+    .replace("__COUNT_NOR0__",   `${nor0.length/4}u`)
+    .replace("__COUNT_BVH0__",   `${bvh0.length/4}u`);
+
+  const module = device.createShaderModule({ code: wgsl });
+
+  // — Quad buffer for VS →
+  const quadVerts = new Float32Array([-1,-1, 1,-1, 1,1, -1,-1, 1,1, -1,1]);
+  const quadBuf   = device.createBuffer({
+    size: quadVerts.byteLength,
+    usage: GPUBufferUsage.VERTEX|GPUBufferUsage.COPY_DST
+  });
+  device.queue.writeBuffer(quadBuf,0,quadVerts);
+
+  // — Bind group layout & entries →
+  const bgl = device.createBindGroupLayout({ entries:[
+    {binding:0,visibility:GPUShaderStage.FRAGMENT,buffer:{type:"read-only-storage"}},
+    {binding:1,visibility:GPUShaderStage.FRAGMENT,buffer:{type:"read-only-storage"}},
+    {binding:2,visibility:GPUShaderStage.FRAGMENT,buffer:{type:"read-only-storage"}},
+    {binding:3,visibility:GPUShaderStage.FRAGMENT,buffer:{type:"read-only-storage"}},
+    {binding:4,visibility:GPUShaderStage.FRAGMENT,buffer:{type:"read-only-storage"}},
+    {binding:5,visibility:GPUShaderStage.FRAGMENT,buffer:{type:"read-only-storage"}},
+    {binding:6,visibility:GPUShaderStage.FRAGMENT,buffer:{type:"uniform"}},
+  ]});
+  const pipeline = device.createRenderPipeline({
+    layout: device.createPipelineLayout({ bindGroupLayouts: [bgl] }),
+    vertex: { module, entryPoint:"vs_main",
+      buffers:[{arrayStride:8,attributes:[{shaderLocation:0,offset:0,format:"float32x2"}]}]
+    },
+    fragment:{ module, entryPoint:"fs_main", targets:[{format}] },
+    primitive:{ topology:"triangle-list" }
+  });
+  const bg = device.createBindGroup({ layout:bgl, entries:[
+    {binding:0,resource:{buffer:triPos0Buf}},
+    {binding:1,resource:{buffer:triPos1Buf}},
+    {binding:2,resource:{buffer:triNor0Buf}},
+    {binding:3,resource:{buffer:triNor1Buf}},
+    {binding:4,resource:{buffer:bvhNodes0Buf}},
+    {binding:5,resource:{buffer:bvhNodes1Buf}},
+    {binding:6,resource:{buffer:uniformBuf}},
+  ]});
+
+  // — Camera & controls —
+  let cameraPos=[0,0,3], yaw=0, pitch=0, keys=[];
+  window.addEventListener("keydown",e=>{if(!keys.includes(e.key))keys.push(e.key);});
+  window.addEventListener("keyup",  e=>{keys=keys.filter(k=>k!==e.key);});
+  canvas.onclick=()=>canvas.requestPointerLock();
+  document.addEventListener("pointerlockchange",()=>{
+    if(document.pointerLockElement===canvas)
+      document.addEventListener("mousemove",onMouseMove);
     else
-      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mousemove",onMouseMove);
   });
   function onMouseMove(e){
-    const s = 0.002;
-    yaw   += e.movementX * s;
-    pitch = Math.max(-Math.PI/2+0.01, Math.min(Math.PI/2-0.01, pitch - e.movementY * s));
+    const s=0.002;
+    yaw   += e.movementX*s;
+    pitch = Math.max(-Math.PI/2+0.01,Math.min(Math.PI/2-0.01,pitch-e.movementY*s));
   }
-  function updateCam(){
-    const cp = Math.cos(pitch), sp = Math.sin(pitch),
-          cy = Math.cos(yaw),   sy = Math.sin(yaw);
-    const fwd  = [cp*sy, sp, -cp*cy],
-          right= [ cy ,  0,  sy ];
-    const speed = 0.05;
-    if (keys.includes("w")) cameraPos = cameraPos.map((v,i)=>v + fwd[i]*speed);
-    if (keys.includes("s")) cameraPos = cameraPos.map((v,i)=>v - fwd[i]*speed);
-    if (keys.includes("a")) cameraPos = cameraPos.map((v,i)=>v - right[i]*speed);
-    if (keys.includes("d")) cameraPos = cameraPos.map((v,i)=>v + right[i]*speed);
-    return [ cameraPos, cameraPos.map((v,i)=>v+fwd[i]), [0,1,0] ];
+  function updateCamera(){
+    const cp=Math.cos(pitch), sp=Math.sin(pitch),
+          cy=Math.cos(yaw),   sy=Math.sin(yaw);
+    const fwd  =[cp*sy,sp,-cp*cy], right=[cy,0,sy];
+    const speed=0.05;
+    if(keys.includes("w")) cameraPos=cameraPos.map((v,i)=>v+fwd[i]*speed);
+    if(keys.includes("s")) cameraPos=cameraPos.map((v,i)=>v-fwd[i]*speed);
+    if(keys.includes("a")) cameraPos=cameraPos.map((v,i)=>v-right[i]*speed);
+    if(keys.includes("d")) cameraPos=cameraPos.map((v,i)=>v+right[i]*speed);
+    return {pos:cameraPos,tgt:cameraPos.map((v,i)=>v+fwd[i]),up:[0,1,0]};
   }
 
-  // FPS smoothing init
-  let lastTime  = performance.now();
-  let smoothFps = 60;
-  const alpha   = 1;
-
-  // render loop
-  function render(){
-    const now = performance.now();
-    const dt  = now - lastTime;
-    const currentFps = 1000 / dt;
-    smoothFps = alpha * currentFps + (1 - alpha) * smoothFps;
-    fpsCounter.textContent = `FPS: ${smoothFps.toFixed(1)}`;
-    lastTime = now;
-
-    // rotate model (optional)
-    const t = now * 0.001, c = Math.cos(t), s = Math.sin(t);
-    gl.uniformMatrix4fv(uModel, false, new Float32Array([
-       c,0, s,0,
-       0,1, 0,0,
-      -s,0, c,0,
-       0,0, 0,1,
-    ]));
-
-    // update camera uniforms
-    const [cp, ct, cu] = updateCam();
-    gl.uniform3fv(uCamPos, cp);
-    gl.uniform3fv(uCamTgt, ct);
-    gl.uniform3fv(uCamUp,  cu);
-    gl.uniform1f( uFov,   Math.PI/4);
-    gl.uniform1f( uAsp,   canvas.width / canvas.height);
-
+  // — Render loop —
+  let lastTime=performance.now(), frameCount=0;
+  function frame(nowMS){
+    const now=nowMS*0.001;
+    frameCount++;
+    if(performance.now()-lastTime>=1000){
+      const fps=frameCount/((performance.now()-lastTime)/1000);
+      document.getElementById("fpsCounter").textContent=`FPS: ${fps.toFixed(1)}`;
+      lastTime=performance.now(); frameCount=0;
+    }
+    // update uniforms
+    const {pos,tgt,up}=updateCamera();
+    const fov=Math.PI/4, aspect=canvas.width/canvas.height;
+    const c=Math.cos(now), s=Math.sin(now);
+    const model=new Float32Array([c,0,s,0, 0,1,0,0, -s,0,c,0, 0,0,0,1]);
+    const udata=new Float32Array([
+      pos[0],pos[1],pos[2],1,  tgt[0],tgt[1],tgt[2],1,
+      up[0], up[1], up[2],0,  5,-5,-5,1,
+      fov,aspect,0,0,  ...model
+    ]);
+    device.queue.writeBuffer(uniformBuf,0,udata);
     // draw
-    gl.viewport(0,0,canvas.width,canvas.height);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-    requestAnimationFrame(render);
+    const cmd=device.createCommandEncoder();
+    const pass=cmd.beginRenderPass({ colorAttachments:[{
+      view:context.getCurrentTexture().createView(),
+      loadOp:"clear", clearValue:{r:0.6,g:0.8,b:1,a:1}, storeOp:"store"
+    }]});
+    pass.setPipeline(pipeline);
+    pass.setBindGroup(0,bg);
+    pass.setVertexBuffer(0,quadBuf);
+    pass.draw(6);
+    pass.end();
+    device.queue.submit([cmd.finish()]);
+    requestAnimationFrame(frame);
   }
-
-  render();
+  requestAnimationFrame(frame);
 }
 
 main().catch(console.error);
